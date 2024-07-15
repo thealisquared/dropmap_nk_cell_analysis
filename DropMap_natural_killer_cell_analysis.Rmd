@@ -1,0 +1,414 @@
+---
+title: "DropMap Natural Killer Cell Analysis"
+name: Ali Ali
+output: html_notebook
+created:
+---
+
+### 1. IMAGE BATCH PROCESSING PREP - SPLIT TIFF IMAGE AND COPY CHANNEL 4 TO NEW DIRECTORY
+```{r}
+setwd("~/Desktop/test/input")
+library(EBImage)
+library(tiff)
+
+#define the input directory and destination directory of the component of interest to be copied and used downstream
+input_directory <- "~/Desktop/test/input/with_perforin"
+destination_directory <- "~/Desktop/test/input/with_perforin/ilastic_input"
+
+#create the destination directory if it doesn't exist
+if (!dir.exists(destination_directory)) {
+  dir.create(destination_directory)
+}
+
+#create a list of TIFF files in the directory
+tiff_files <- list.files(input_directory, pattern = "\\.tif$", full.names = TRUE)
+
+#process each TIFF file
+for (input_filepath in tiff_files) {
+  #load TIFF image
+  img <- readImage(input_filepath)
+  
+  #get the number of channels in the image
+  num_channels <- dim(img)[3]
+  
+  #get the base name of the input file (without the extension)
+  input_basename <- tools::file_path_sans_ext(basename(input_filepath))
+  
+  #loop through each channel and save it as a separate image
+  for (i in 1:num_channels) {
+    # Extract the i-th channel
+    channel_img <- img[,,i]
+    
+    #generate the output filename as "component_n" where n is the nth channel
+    output_filename <- file.path(input_directory, paste0(input_basename, "_component_", i, ".tif"))
+    
+    #write the channel image to a new file
+    writeImage(channel_img, output_filename)
+    
+    cat("Saved channel", i, "of", input_basename, "as", output_filename, "\n")
+    
+    #if the current channel is component_4, copy it to the destination folder
+    if (i == 4) {
+      destination_filename <- file.path(destination_directory, basename(output_filename))
+      file.copy(output_filename, destination_filename)
+      cat("Copied", output_filename, "to", destination_filename, "\n")
+    }
+  }
+  
+  cat("All channels of", input_basename, "have been saved.\n")
+}
+
+cat("All TIFF files have been processed.\n")
+
+```
+
+### 3. IMAGE BATCH PROCESSING PREP - RUN ILASTIC PIPELINE
+
+### 2. IMAGE BATCH PROCESSING PREP - MIGRATE COMPONENT IMAGES OF PARENT TIFF TO FOLDER
+```{r}
+library(tools)
+
+#define input directory
+input_directory <- "~/Desktop/test/input"
+
+#create a list of all files in the directory
+files <- list.files(input_directory, full.names = TRUE)
+
+#create a function to get the prefix of a file
+get_prefix <- function(filename) {
+  #extract the base name of the file (without the path)
+  base_name <- basename(filename)
+  
+  #split the base name by underscores
+  parts <- unlist(strsplit(base_name, "_"))
+  
+  #check if there are at least three parts (one underscore)
+  if (length(parts) >= 3) {
+    #join the parts before the third underscore to get the prefix
+    prefix <- paste(parts[1:3], collapse = "_")
+  } else {
+    #if there are less than three parts, use the whole base name
+    prefix <- base_name
+  }
+  
+  return(prefix)
+}
+
+#loop through each file and move it to the corresponding folder
+for (file in files) {
+  #get the prefix of the file
+  prefix <- get_prefix(file)
+  
+  #define the destination folder
+  destination_folder <- file.path(input_directory, prefix)
+  
+  #create the destination folder if it doesn't exist
+  if (!dir.exists(destination_folder)) {
+    dir.create(destination_folder)
+  }
+  
+  #define the destination file path
+  destination_file <- file.path(destination_folder, basename(file))
+  
+  #move the file to the destination folder
+  file.rename(file, destination_file)
+  
+  cat("Moved", file, "to", destination_file, "\n")
+}
+
+cat("All files have been migrated.\n")
+```
+
+### 4. INITIATE DATA ANALYSIS
+```{r}
+setwd("~/Desktop/test/input")
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+```
+
+### IMPORT DATA
+```{r}
+#load cell count files and add time point column
+data <- read.csv("objectcounts.csv")
+```
+
+### DATA PRE PROCESSING
+```{r}
+#split file name and extract condition and timepoint into new columns 
+split_and_extract <- function(data, existing_col, new_col1, new_col2) {
+  #create the presplit column by splitting the existing column on the first "_"
+  data$presplit <- sapply(strsplit(data[[existing_col]], "_"), `[`, 1)
+  
+  #create the new condition and timepoint columns
+  data <- data %>%
+    mutate(!!new_col1 := str_extract(presplit, "[a-zA-Z ]+"),
+           !!new_col2 := as.numeric(str_extract(presplit, "\\d+")))
+  
+  #remove the presplit column
+  data$presplit <- NULL
+  
+  return(data)
+}
+data <- split_and_extract(data, "FileName_bubble_ilastik", "condition", "timepoint")
+
+#trim data to include object number, counts, location, condition, and timepoint columns
+trim_data <- function(data) {
+  data <- data[, -c(1,3:12,21)]
+  return(data)
+}
+data <- trim_data(data)
+
+#rename cell count columns
+rename_cols <- function(data) {
+  data <- data %>% rename(
+    deadkiller_count = Children_Identifydeadkiller_Count, 
+    deadtarget_count = Children_Identifydeadtarget_Count, 
+    alivekiller_count = Children_Identifyalivekiller_Count, 
+    alivetarget_count = Children_Identifyalivetarget_Count,
+    killer_count = Children_Identifykiller_Count,
+    target_count = Children_Identifytarget_Count
+  )
+  return(data)
+}
+data <- rename_cols(data)
+
+#add new column that contains info of ratio of target cells to killer cells in each bubble
+ratio_col <- function(data) {
+  data <- data %>% mutate(ratio_target_killer = target_count / killer_count) %>%
+  mutate(ratio_target_killer = sprintf("%d:%d", target_count, killer_count)) %>%
+  mutate(ratio_target_killer = factor(ratio_target_killer)
+  )
+  return(data)
+}
+data <- ratio_col(data)
+
+#combine all data frames
+combined_df <- data
+
+#identify and filter artefacts
+artefacts <- combined_df %>% filter(killer_count >= 4 | target_count >= 4)
+combined_df <- combined_df %>% filter(killer_count < 4) %>% filter(target_count < 4)
+```
+
+### CREATE TARGET, KILLER, AND PAIRED DATA
+```{r}
+#target only bubbles - filter to include bubbles with targets and no killers
+target_data <- combined_df  %>% 
+  filter(target_count > 0 & killer_count == 0)
+
+#killer only bubbles - filter to include bubbles with killers and no targets
+killer_data <- combined_df  %>% 
+  filter(killer_count > 0 & target_count == 0)
+
+#target and killer bubbles - filter to include bubbles with both targets and killers
+target_killer_data <- rbind(combined_df  %>% 
+                              filter(deadtarget_count > 0 & deadkiller_count > 0), 
+                            combined_df  %>% 
+                              filter(deadtarget_count > 0 & alivekiller_count > 0), 
+                            combined_df  %>% 
+                              filter(alivetarget_count > 0 & deadkiller_count > 0), 
+                            combined_df  %>% 
+                              filter(alivetarget_count > 0 & alivekiller_count > 0)) %>% unique()
+```
+
+### BUBBLE AND CELL COUNT SUMMARY
+```{r}
+#killer only bubbles
+killer_ctrl_summary1 <- rbind(
+  #without perforin
+  killer_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count), alivekiller_count = sum(alivekiller_count)),
+  #with perforin
+  killer_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count), alivekiller_count = sum(alivekiller_count))
+  ) %>% 
+  unique()
+
+killer_ctrl_summary2 <- rbind(
+  #without perforin
+  killer_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count), alivekiller_count = sum(alivekiller_count)),
+  #with perforin
+  killer_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count), alivekiller_count = sum(alivekiller_count))
+  ) %>% 
+  unique()
+
+
+#target only bubbles
+target_ctrl_summary1 <- rbind(
+  #without perforin
+  target_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), alivetarget_count = sum(alivetarget_count)),
+  #with perforin
+  target_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), alivetarget_count = sum(alivetarget_count))
+  ) %>% 
+  unique()
+
+target_ctrl_summary2 <- rbind(
+  #without perforin
+  target_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), alivetarget_count = sum(alivetarget_count)),
+  #with perforin
+  target_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), alivetarget_count = sum(alivetarget_count))
+  ) %>% 
+  unique()
+
+
+
+#paired bubbles
+exp_summary1 <- rbind(
+  #without perforin
+  target_killer_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count)),
+  #with perforin
+  target_killer_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(time_point) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count))
+  ) %>% 
+  unique()
+
+exp_summary2 <- rbind(
+  #without perforin
+  target_killer_data %>% 
+    filter(condition == "without_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count)),
+  #with perforin
+  target_killer_data %>% 
+    filter(condition == "with_perforin") %>%
+    group_by(ratio_target_killer) %>% 
+    summarise(bubble_count = n(), condition, target_count = sum(target_count), deadtarget_count = sum(deadtarget_count), killer_count = sum(killer_count), deadkiller_count = sum(deadkiller_count))
+  ) %>% 
+  unique()
+```
+
+### DISTRIBUTION PLOTS
+```{r}
+#killer distribution in droplets
+ggplot(data.frame(combined_df %>% group_by(killer_count) %>% summarise(count = n()) %>% mutate(pct = (count/sum(count))*100)), aes(x = killer_count, y = pct)) +
+   geom_bar(stat = "identity", width = 0.5, fill = "#CC79A7") +
+   labs(title = "NK distribution in droplets", x = "Killer Count", y = "% droplets with cells") +
+   ylim(0, 100) +
+   theme_classic()
+
+#target distribution in droplets
+ggplot(data.frame(combined_df  %>% group_by(target_count) %>% summarise(count = n()) %>% mutate(pct = (count/sum(count))*100)), aes(x = target_count, y = pct)) +
+   geom_bar(stat = "identity", width = 0.5, fill = "#56B4E9") +
+   labs(title = "YAC distribution in droplets", x = "Target Count", y = "% droplets with cells") +
+   ylim(0, 100) +
+   theme_classic()
+
+#cell pairing in droplets
+ggplot(data.frame(
+  bubble = c("paired", "unpaired killers", "unpaired targets"), 
+  pct = c(
+    (nrow(target_killer_data) / (nrow(target_killer_data) + nrow(killer_data) + nrow(target_data))) * 100, 
+    (nrow(killer_data) / (nrow(target_killer_data) + nrow(killer_data) + nrow(target_data))) * 100, 
+    (nrow(target_data) / (nrow(target_killer_data) + nrow(killer_data) + nrow(target_data))) * 100)), 
+  aes(x = bubble, y = pct)) +
+   geom_bar(stat = "identity", width = 0.5, fill = c("#E69F00" , "#CC79A7", "#56B4E9")) +
+   labs(title = "Cell Pairing in Droplets", x = "droplet type", y = "% droplets with cells") +
+   ylim(0, 100) +
+   theme_classic()
+
+#T:K ratio distribution
+ggplot(data.frame(combined_df %>%group_by(ratio_target_killer) %>% summarise(count = n()) %>% mutate(pct = (count/sum(count))*100)), aes(x = ratio_target_killer, y = pct)) +
+   geom_bar(stat = "identity", fill = "#E69F00") +
+   labs(title = "T:K Ratio Distribution", x = "T:K Ratios in Bubbles", y = "% droplets") +
+   ylim(0, 100) +
+   theme_classic()
+
+#killer and target counts in paired droplets
+ggplot(data.frame(cell = c("killer", "target"), sum = c(sum(target_killer_data$killer_count), sum(target_killer_data$target_count))) %>% 
+                    mutate(pct = (sum/(sum(target_killer_data$killer_count) + sum(target_killer_data$target_count)) * 100)), 
+       aes(x = cell, y = pct)) +
+   geom_bar(stat = "identity", width = 0.5, color = "#E69F00", fill = c("#CC79A7", "#56B4E9")) +
+   labs(title = "Killer and Target Counts in Paired Droplets", x = " ", y = "% cells in droplets") +
+   ylim(0, 100) +
+   theme_classic()
+```
+
+### CYTOTOXCITY PLOTS
+```{r}
+cytotox1 <- rbind(
+  target_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "target_only") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+  
+   target_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "target_only") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+  
+  killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "killer_only") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+  
+  killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "killer_only") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+  
+  target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+  
+    target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count", "target_count", "killer_count")) %>% unique(),
+) %>% mutate(pct = (death/total_cell_count) * 100)
+
+ggplot(cytotox1, aes(x = time_point, y = pct, color = bubble_type)) + 
+ geom_line() + 
+ labs(title = "Cytotoxcity Profile", x = "time (hr)", y = "% caspase postive cells") +
+ facet_wrap(vars(condition)) +
+ scale_color_manual(values = c("killer_only" = "#56B4E9", "paired" = "#E69F00", "target_only" = "#CC79A7"),
+                    labels = c("killer_only" = "killer only", "target_only" = "target only")) +
+ ylim(0, 100) +
+ theme_classic()  +
+ theme(legend.position = "bottom")
+
+#ggsave(filename = "cytotox1.png", width = 2000, height = 1000, units = "px", plot = cytotox1)
+
+
+
+cytotox2 <- rbind(
+  target_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "target_only") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+   target_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "target_only") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+  killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "killer_only") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+  killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "killer_only") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count, deadkiller_count), total_cell_count = sum(target_count, killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+  target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired_targetdeath") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count), total_cell_count = sum(target_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+    target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired_targetdeath") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadtarget_count), total_cell_count = sum(target_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+    target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired_killerdeath") %>% filter(condition == "without_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadkiller_count), total_cell_count = sum(killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique(),
+  
+    target_killer_data[, c("condition", "time_point", "deadtarget_count", "deadkiller_count", "target_count", "killer_count")] %>% mutate(bubble_type = "paired_killerdeath") %>% filter(condition == "with_perforin") %>% group_by(time_point) %>% mutate(death = sum(deadkiller_count), total_cell_count = sum(killer_count)) %>% select(-c("deadtarget_count", "deadkiller_count")) %>% unique()
+) %>% mutate(pct = (death/total_cell_count) * 100)
+
+ggplot(cytotox2, aes(x = time_point, y = pct, color = bubble_type)) + 
+ geom_line() + 
+ labs(title = "Cytotoxcity Profile", x = "time (hr)", y = "% caspase postive cells") +
+ facet_wrap(vars(condition)) +
+ scale_color_manual(values = c("killer_only" = "#56B4E9", "paired_killerdeath" = "#E69F00", "paired_targetdeath" = "#F0E442", "target_only" = "#CC79A7"), 
+                    labels = c("killer_only" = "killer only (killer death)", "paired_killerdeath" =  "paired (killer death)", "paired_targetdeath" = "paired (target death)", "target_only" = "target only (target death)")) +
+ ylim(0, 100) +
+ theme_classic() +
+ theme(legend.position = "bottom")
+
+#ggsave(filename = "cytotox2.png", width = 2000, height = 1000, units = "px", plot = cytotox2)
+```
